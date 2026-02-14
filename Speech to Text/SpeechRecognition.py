@@ -1,14 +1,12 @@
 # sudo apt-get install -y python3-pyaudio
-# sudo pip3 install vosk numpy
+# pip3 install vosk
 
 import os
 import sys
 import json
 import time
-import math
-import struct
+import audioop
 import pyaudio
-import numpy as np
 from vosk import Model, KaldiRecognizer
 
 # -----------------------------
@@ -22,132 +20,91 @@ if not os.path.exists(model_path):
 model = Model(model_path)
 
 # -----------------------------
-# Audio settings
+# Audio settings (LOW latency)
 # -----------------------------
-sample_rate = 16000
-chunk_size = 1024          # lower = less delay; 1024 is fast on Pi 5
-format = pyaudio.paInt16
-channels = 1
+SAMPLE_RATE = 16000
+CHUNK = 1024                 # 1024 is low delay; try 512 if your CPU can handle it
+FORMAT = pyaudio.paInt16
+CHANNELS = 1
 
 # -----------------------------
-# Adaptive gate settings
+# Gate settings (tune these)
 # -----------------------------
-CALIBRATE_SECONDS = 2.0    # stay quiet
-THRESH_MULT = 2.5          # higher = less sensitive (try 2.0–3.5)
-MIN_RMS = 120              # floor threshold for low RMS mics
-SPEECH_HANGOVER = 0.25     # shorter = less delay
-BAND_RATIO_TH = 0.35       # higher = stricter speech-only (try 0.30–0.55)
+CALIBRATE_SECONDS = 1.0      # quick ambient sample
+THRESH_MULT = 2.2            # higher = less sensitive (try 2.0–3.5)
+MIN_THRESHOLD = 120          # floor for low RMS mics
+HANGOVER = 0.20              # seconds; lower = stops listening quicker
 
-# Optional: see tuning values live
-PRINT_DEBUG = True
-
-def rms_int16(audio_bytes: bytes) -> float:
-    n = len(audio_bytes) // 2
-    if n <= 0:
-        return 0.0
-    samples = struct.unpack("<" + "h" * n, audio_bytes)
-    acc = 0
-    for s in samples:
-        acc += s * s
-    return math.sqrt(acc / n)
-
-def speech_band_ratio(audio_bytes: bytes, sr: int) -> float:
-    """
-    Returns fraction of energy in ~300–3000 Hz band vs total energy.
-    Helps reject low-frequency rumble and some non-speech noise.
-    """
-    x = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
-    if x.size == 0:
-        return 0.0
-
-    # window to reduce spectral leakage
-    x *= np.hanning(x.size)
-
-    spec = np.fft.rfft(x)
-    mag2 = (spec.real**2 + spec.imag**2)
-
-    freqs = np.fft.rfftfreq(x.size, d=1.0/sr)
-
-    total = mag2.sum()
-    if total <= 0:
-        return 0.0
-
-    band = mag2[(freqs >= 300) & (freqs <= 3000)].sum()
-    return float(band / total)
+PRINT_DEBUG = False          # True shows RMS/threshold to tune
 
 # -----------------------------
 # PyAudio init
 # -----------------------------
 p = pyaudio.PyAudio()
 stream = p.open(
-    format=format,
-    channels=channels,
-    rate=sample_rate,
+    format=FORMAT,
+    channels=CHANNELS,
+    rate=SAMPLE_RATE,
     input=True,
-    frames_per_buffer=chunk_size
+    frames_per_buffer=CHUNK
 )
 
-recognizer = KaldiRecognizer(model, sample_rate)
-recognizer.SetWords(True)
+rec = KaldiRecognizer(model, SAMPLE_RATE)
+rec.SetWords(True)
 
 os.system("clear")
+print(f"Calibrating ambient noise for {CALIBRATE_SECONDS:.1f}s... stay quiet.")
 
 # -----------------------------
-# Calibrate ambient RMS
+# Calibrate ambient RMS (FAST)
 # -----------------------------
-print(f"Calibrating ambient noise for {CALIBRATE_SECONDS:.1f}s... stay quiet.")
 levels = []
-start = time.time()
-while time.time() - start < CALIBRATE_SECONDS:
-    data = stream.read(chunk_size, exception_on_overflow=False)
-    levels.append(rms_int16(data))
+t0 = time.time()
+while time.time() - t0 < CALIBRATE_SECONDS:
+    data = stream.read(CHUNK, exception_on_overflow=False)
+    levels.append(audioop.rms(data, 2))   # width=2 bytes for int16
 
 levels.sort()
-ambient = levels[int(len(levels) * 0.7)] if levels else 0.0
-RMS_THRESHOLD = max(MIN_RMS, int(ambient * THRESH_MULT))
+ambient = levels[int(len(levels) * 0.7)] if levels else 0
+THRESH = max(MIN_THRESHOLD, int(ambient * THRESH_MULT))
 
-print(f"Ambient RMS ≈ {int(ambient)}")
-print(f"RMS_THRESHOLD ≈ {RMS_THRESHOLD}  (mult={THRESH_MULT})")
-print(f"BAND_RATIO_TH = {BAND_RATIO_TH}")
-print("\nSpeak now... (FAST partial + better background rejection)\n")
+print(f"Ambient RMS ≈ {ambient}")
+print(f"Threshold  ≈ {THRESH} (mult={THRESH_MULT})")
+print("\nSpeak now...\n")
 
 last_voice_time = 0.0
 last_partial = ""
 
 try:
     while True:
-        data = stream.read(chunk_size, exception_on_overflow=False)
-        level = rms_int16(data)
-        ratio = speech_band_ratio(data, sample_rate)
+        data = stream.read(CHUNK, exception_on_overflow=False)
+
+        rms = audioop.rms(data, 2)
         now = time.time()
 
-        # Decide if this chunk looks like "speech nearby"
-        looks_like_speech = (level >= RMS_THRESHOLD) and (ratio >= BAND_RATIO_TH)
-
-        if looks_like_speech:
+        if rms >= THRESH:
             last_voice_time = now
 
-        speech_active = (now - last_voice_time) <= SPEECH_HANGOVER
+        speech_active = (now - last_voice_time) <= HANGOVER
 
         if PRINT_DEBUG:
-            sys.stdout.write(f"\rRMS={int(level)} TH={RMS_THRESHOLD}  ratio={ratio:.2f}  act={int(speech_active)}   ")
+            sys.stdout.write(f"\rRMS={rms:4d} TH={THRESH:4d} act={int(speech_active)}   ")
             sys.stdout.flush()
 
         if not speech_active:
-            # don’t feed Vosk when we think it's just background
             if not PRINT_DEBUG:
                 sys.stdout.write("\r(quiet)   ")
                 sys.stdout.flush()
             continue
 
-        # Feed Vosk (FAST partial output)
-        if recognizer.AcceptWaveform(data):
-            result = json.loads(recognizer.Result()).get("text", "")
+        # IMPORTANT: feed audio first, then ask for partial
+        if rec.AcceptWaveform(data):
+            result = json.loads(rec.Result()).get("text", "")
             if result:
                 print("\r" + result + " " * 20)
             last_partial = ""
         else:
-            partial = json.loads(recognizer.PartialResult()).get("partial", "")
+            partial = json.loads(rec.PartialResult()).get("partial", "")
             if partial and partial != last_partial:
                 sys.stdout.write("\r" + partial + " " * 20)
                 sys.stdout.flush()
