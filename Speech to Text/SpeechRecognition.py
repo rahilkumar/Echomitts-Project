@@ -8,7 +8,6 @@ from collections import deque
 import pyaudio
 from vosk import Model, KaldiRecognizer
 
-# ---- Model ----
 model_path = "models/vosk-model-small-en-us-0.15/"
 if not os.path.exists(model_path):
     print(f"Model '{model_path}' not found.")
@@ -16,23 +15,19 @@ if not os.path.exists(model_path):
 
 model = Model(model_path)
 
-# ---- Low-latency audio ----
 SAMPLE_RATE = 16000
-CHUNK = 320                 # ~20ms @ 16kHz. Use 512 if needed.
+CHUNK = 320
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 
-# ---- Adaptive gate (handles loud -> quiet changes) ----
 NOISE_ALPHA = 0.02
-SPEECH_MULT = 2.2           # higher = ignore more background (try 2.0–2.8)
+SPEECH_MULT = 2.2
 MIN_THRESHOLD = 80
 
-# ---- Stability (avoid flicker) ----
 SMOOTH_ALPHA = 0.25
-HANGOVER = 0.28             # a bit longer helps avoid on/off while speaking
+HANGOVER = 0.30
 
-# ---- Pre-roll (don’t miss beginnings) ----
-PREROLL_SECONDS = 0.20
+PREROLL_SECONDS = 0.25
 PREROLL_CHUNKS = max(1, int((PREROLL_SECONDS * SAMPLE_RATE) / CHUNK))
 preroll = deque(maxlen=PREROLL_CHUNKS)
 
@@ -52,27 +47,31 @@ def new_recognizer():
     return r
 
 p = pyaudio.PyAudio()
-stream = p.open(
-    format=FORMAT,
-    channels=CHANNELS,
-    rate=SAMPLE_RATE,
-    input=True,
-    frames_per_buffer=CHUNK
-)
+stream = p.open(format=FORMAT, channels=CHANNELS, rate=SAMPLE_RATE,
+                input=True, frames_per_buffer=CHUNK)
 
 rec = new_recognizer()
 
 os.system("clear")
-print("Live Speech-to-Text (prints ONE line when you stop speaking)")
+print("Live Speech-to-Text (clean output)")
 print("Ctrl+C to stop.\n")
 
 noise_est = 150.0
 lvl_smooth = noise_est
 last_voice_time = 0.0
-
 speech_active = False
-fed_preroll = False
 last_partial = ""
+last_partial_len = 0
+
+def write_live(line: str):
+    """Write one-line live caption without creating blank lines."""
+    global last_partial_len
+    line = line.strip()
+    # pad with spaces to overwrite leftovers from previous longer text
+    pad = " " * max(0, last_partial_len - len(line))
+    sys.stdout.write("\r" + line + pad)
+    sys.stdout.flush()
+    last_partial_len = len(line)
 
 try:
     while True:
@@ -82,7 +81,6 @@ try:
         lvl = rms_int16(data)
         lvl_smooth = (1 - SMOOTH_ALPHA) * lvl_smooth + SMOOTH_ALPHA * lvl
 
-        # Update noise estimate only when not speaking
         if not speech_active:
             noise_est = (1 - NOISE_ALPHA) * noise_est + NOISE_ALPHA * lvl_smooth
 
@@ -97,41 +95,34 @@ try:
         # Speech started
         if active_now and not speech_active:
             speech_active = True
-            fed_preroll = False
             last_partial = ""
-            # feed pre-roll ONCE at start so we don't miss first syllable
+            last_partial_len = 0
+            # feed pre-roll once
             for chunk in preroll:
                 rec.AcceptWaveform(chunk)
-            fed_preroll = True
 
-        # During speech: feed audio + show partial captions (live)
+        # During speech: feed + show partial live
         if speech_active:
-            rec.AcceptWaveform(data)  # we feed it, but we DO NOT print Result() here
-
-            partial = json.loads(rec.PartialResult()).get("partial", "")
+            rec.AcceptWaveform(data)
+            partial = json.loads(rec.PartialResult()).get("partial", "").strip()
             if partial and partial != last_partial:
-                sys.stdout.write("\r" + partial + " " * 40)
-                sys.stdout.flush()
+                write_live(partial)
                 last_partial = partial
 
-        # Speech ended: print ONE final line and reset recognizer
-        if speech_active and (not active_now):
+        # Speech ended: print final once, reset recognizer
+        if speech_active and not active_now:
             speech_active = False
-
             final_text = json.loads(rec.FinalResult()).get("text", "").strip()
 
-            # Clear the caption line
-            sys.stdout.write("\r" + " " * 140 + "\r")
+            # Move to a new line cleanly (no blank gaps)
+            sys.stdout.write("\r")
             sys.stdout.flush()
+            print(final_text if final_text else "")  # prints one line (can be empty)
 
-            if final_text:
-                print(final_text)
-
-            # Reset for next utterance (prevents duplicate finals)
             rec = new_recognizer()
             preroll.clear()
             last_partial = ""
-            continue
+            last_partial_len = 0
 
 except KeyboardInterrupt:
     print("\nStopping...")
