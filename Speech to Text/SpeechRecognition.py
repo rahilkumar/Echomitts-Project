@@ -8,27 +8,32 @@ from collections import deque
 import pyaudio
 from vosk import Model, KaldiRecognizer
 
+# ---- Model ----
 model_path = "models/vosk-model-small-en-us-0.15/"
 if not os.path.exists(model_path):
-    print("Model not found.")
+    print(f"Model '{model_path}' not found.")
     sys.exit(1)
 
 model = Model(model_path)
 
+# ---- Low-latency audio ----
 SAMPLE_RATE = 16000
-CHUNK = 512
+CHUNK = 320  # ~20ms @ 16kHz (lower latency than 512). Try 320 or 480.
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 
-# Adaptive tuning
-NOISE_ALPHA = 0.02        # how fast noise estimate adapts (lower = slower)
-SPEECH_MULT = 2.0         # how much louder than noise to trigger
+# ---- Adaptive gate (handles loud->quiet transitions) ----
+NOISE_ALPHA = 0.02      # noise adapts speed (0.01–0.05)
+SPEECH_MULT = 2.0       # higher = ignore more background (1.6–3.0)
 MIN_THRESHOLD = 80
-HANGOVER = 0.18
-SMOOTH_ALPHA = 0.25
 
-PREROLL_SECONDS = 0.3
-PREROLL_CHUNKS = int((PREROLL_SECONDS * SAMPLE_RATE) / CHUNK)
+# ---- Smooth + hangover to avoid chopping words ----
+SMOOTH_ALPHA = 0.25
+HANGOVER = 0.20         # seconds to keep "speech active" after level drops
+
+# ---- Pre-roll so we don't miss the start of words ----
+PREROLL_SECONDS = 0.25
+PREROLL_CHUNKS = max(1, int((PREROLL_SECONDS * SAMPLE_RATE) / CHUNK))
 
 def rms_int16(audio_bytes: bytes) -> float:
     samples = array('h')
@@ -41,17 +46,17 @@ def rms_int16(audio_bytes: bytes) -> float:
     return math.sqrt(acc / len(samples))
 
 p = pyaudio.PyAudio()
-stream = p.open(format=FORMAT, channels=CHANNELS,
-                rate=SAMPLE_RATE, input=True,
-                frames_per_buffer=CHUNK)
+stream = p.open(format=FORMAT, channels=CHANNELS, rate=SAMPLE_RATE,
+                input=True, frames_per_buffer=CHUNK)
 
 rec = KaldiRecognizer(model, SAMPLE_RATE)
 
 os.system("clear")
-print("Adaptive speech recognition running...\n")
+print("Live Speech-to-Text (partial captions + final lines)")
+print("Ctrl+C to stop.\n")
 
-noise_estimate = 200.0   # starting guess
-level_smooth = noise_estimate
+noise_est = 150.0
+lvl_smooth = noise_est
 last_voice_time = 0.0
 speech_active = False
 last_partial = ""
@@ -63,31 +68,28 @@ try:
         data = stream.read(CHUNK, exception_on_overflow=False)
         preroll.append(data)
 
-        level = rms_int16(data)
+        lvl = rms_int16(data)
+        lvl_smooth = (1 - SMOOTH_ALPHA) * lvl_smooth + SMOOTH_ALPHA * lvl
 
-        # Smooth level
-        level_smooth = (1 - SMOOTH_ALPHA) * level_smooth + SMOOTH_ALPHA * level
-
-        # Update background noise estimate ONLY when not speaking
+        # Update noise estimate only when we believe it's NOT speech
         if not speech_active:
-            noise_estimate = (1 - NOISE_ALPHA) * noise_estimate + NOISE_ALPHA * level_smooth
+            noise_est = (1 - NOISE_ALPHA) * noise_est + NOISE_ALPHA * lvl_smooth
 
-        threshold = max(MIN_THRESHOLD, noise_estimate * SPEECH_MULT)
+        threshold = max(MIN_THRESHOLD, noise_est * SPEECH_MULT)
 
         now = time.time()
-
-        if level_smooth >= threshold:
+        if lvl_smooth >= threshold:
             last_voice_time = now
 
         active_now = (now - last_voice_time) <= HANGOVER
 
-        # Speech started
+        # speech just started -> feed pre-roll so we don't miss word beginnings
         if active_now and not speech_active:
             for chunk in preroll:
                 rec.AcceptWaveform(chunk)
             speech_active = True
 
-        # Speech ended
+        # speech ended
         if not active_now and speech_active:
             speech_active = False
             last_partial = ""
@@ -96,18 +98,20 @@ try:
         if not active_now:
             continue
 
-        # Recognition
+        # Feed audio. Show partial captions live.
         if rec.AcceptWaveform(data):
             text = json.loads(rec.Result()).get("text", "").strip()
             if text:
-                sys.stdout.write("\r" + " " * 100 + "\r")
+                # Clear caption line and print final as a new line
+                sys.stdout.write("\r" + " " * 120 + "\r")
                 sys.stdout.flush()
                 print(text)
             last_partial = ""
         else:
             partial = json.loads(rec.PartialResult()).get("partial", "")
             if partial and partial != last_partial:
-                sys.stdout.write("\r" + partial + " " * 20)
+                # Live captions on one line
+                sys.stdout.write("\r" + partial + " " * 30)
                 sys.stdout.flush()
                 last_partial = partial
 
@@ -115,6 +119,9 @@ except KeyboardInterrupt:
     print("\nStopping...")
 
 finally:
-    stream.stop_stream()
-    stream.close()
+    try:
+        stream.stop_stream()
+        stream.close()
+    except Exception:
+        pass
     p.terminate()
