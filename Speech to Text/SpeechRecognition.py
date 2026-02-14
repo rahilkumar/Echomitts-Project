@@ -24,19 +24,19 @@ model = Model(model_path)
 # Audio settings (LOW latency)
 # -----------------------------
 SAMPLE_RATE = 16000
-CHUNK = 512                 # 512 = very low delay; try 1024 if CPU spikes
+CHUNK = 512                 # keep low latency like your code
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 
 # -----------------------------
-# Gate settings (tune these)
+# Gate settings (more sensitive = picks up a bit more background)
 # -----------------------------
-CALIBRATE_SECONDS = 1.0     # quick ambient sample
-THRESH_MULT = 2.0           # higher = less sensitive (try 1.6–3.0)
-MIN_THRESHOLD = 120         # floor for low RMS mics
-HANGOVER = 0.12             # seconds; lower = less delay
+CALIBRATE_SECONDS = 1.0
+THRESH_MULT = 1.6           # LOWER = more sensitive (more background)
+MIN_THRESHOLD = 90          # LOWER = more sensitive
+HANGOVER = 0.18             # slightly higher = keeps listening a bit longer
 
-PRINT_DEBUG = False         # True shows RMS/threshold to tune
+PRINT_DEBUG = False         # True shows RMS/threshold
 
 def rms_int16(audio_bytes: bytes) -> float:
     """Fast RMS for 16-bit mono PCM using only stdlib."""
@@ -83,10 +83,9 @@ THRESH = max(MIN_THRESHOLD, int(ambient * THRESH_MULT))
 
 print(f"Ambient RMS ≈ {int(ambient)}")
 print(f"Threshold  ≈ {THRESH} (mult={THRESH_MULT})")
-print("\nSpeak now...\n")
+print("\nSpeak now... (prints FINAL lines only)\n")
 
 last_voice_time = 0.0
-last_partial = ""
 
 try:
     while True:
@@ -95,6 +94,7 @@ try:
         level = rms_int16(data)
         now = time.time()
 
+        # Gate: only feed recognizer when speech seems active
         if level >= THRESH:
             last_voice_time = now
 
@@ -105,23 +105,13 @@ try:
             sys.stdout.flush()
 
         if not speech_active:
-            if not PRINT_DEBUG:
-                sys.stdout.write("\r(quiet)   ")
-                sys.stdout.flush()
             continue
 
-        # Feed audio first, then get partials (fast)
+        # Feed audio; print ONLY finalized text line-by-line
         if rec.AcceptWaveform(data):
-            result = json.loads(rec.Result()).get("text", "")
-            if result:
-                print("\r" + result + " " * 30)
-            last_partial = ""
-        else:
-            partial = json.loads(rec.PartialResult()).get("partial", "")
-            if partial and partial != last_partial:
-                sys.stdout.write("\r" + partial + " " * 30)
-                sys.stdout.flush()
-                last_partial = partial
+            text = json.loads(rec.Result()).get("text", "").strip()
+            if text:
+                print(text)
 
 except KeyboardInterrupt:
     print("\nStopping...")
